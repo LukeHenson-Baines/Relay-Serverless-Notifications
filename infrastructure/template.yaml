@@ -1,0 +1,155 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Relay - serverless asynchronous email notification service.
+
+Parameters:
+  SourceEmail:
+    Type: String
+    Description: Verified SES email address used to send Relay notifications.
+
+Globals:
+  Function:
+    Runtime: python3.14
+    Architectures:
+      - x86_64
+    Timeout: 15
+    MemorySize: 256
+    CodeUri: ../
+
+Resources:
+
+  # ---------------------------------------------------------
+  # API Gateway
+  # ---------------------------------------------------------
+
+  RelayApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+
+  # ---------------------------------------------------------
+  # DynamoDB
+  # ---------------------------------------------------------
+
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: event_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: event_id
+          KeyType: HASH
+
+  # ---------------------------------------------------------
+  # SQS
+  # ---------------------------------------------------------
+
+  NotificationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 90
+
+  # ---------------------------------------------------------
+  # POST /events
+  # ---------------------------------------------------------
+
+  CreateEventFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.api.create_event.lambda_handler
+
+      Environment:
+        Variables:
+          EVENTS_TABLE: !Ref EventsTable
+          QUEUE_URL: !Ref NotificationQueue
+
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt NotificationQueue.QueueName
+
+      Events:
+        CreateEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RelayApi
+            Path: /events
+            Method: POST
+
+  # ---------------------------------------------------------
+  # GET /events/{event_id}
+  # ---------------------------------------------------------
+
+  GetEventFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.api.get_event.lambda_handler
+
+      Environment:
+        Variables:
+          EVENTS_TABLE: !Ref EventsTable
+
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref EventsTable
+
+      Events:
+        GetEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RelayApi
+            Path: /events/{event_id}
+            Method: GET
+
+  # ---------------------------------------------------------
+  # SQS -> delivery worker
+  # ---------------------------------------------------------
+
+  DeliveryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.worker.deliver_notification.lambda_handler
+
+      Environment:
+        Variables:
+          EVENTS_TABLE: !Ref EventsTable
+          SOURCE_EMAIL: !Ref SourceEmail
+
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource:
+                - !Sub arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${SourceEmail}
+
+      Events:
+        NotificationQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt NotificationQueue.Arn
+            BatchSize: 1
+
+Outputs:
+
+  RelayApiUrl:
+    Description: Base URL for the Relay API
+    Value: !Sub "https://${RelayApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  EventsTableName:
+    Description: DynamoDB event table
+    Value: !Ref EventsTable
+
+  NotificationQueueUrl:
+    Description: Relay SQS notification queue
+    Value: !Ref NotificationQueue

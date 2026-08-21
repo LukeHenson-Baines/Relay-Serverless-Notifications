@@ -10,6 +10,7 @@ __pycache__/
 
 # AWS SAM
 .aws-sam/
+samconfig.toml 
 
 # Environment variables
 .env
